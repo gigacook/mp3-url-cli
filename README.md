@@ -179,3 +179,9 @@ here, and the pipeline was never producing it.
 
 Nothing special needed — Ghostty pastes multi-line safely (bracketed paste), so
 dropping a block of links into `mp3 -i` works: each line becomes one job.
+
+## ☕ Support
+
+Free, no pop-ups, no fake DOWNLOAD buttons. If it got that one song onto your iPod, you can buy me a coffee:
+
+[![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/gigacook)
