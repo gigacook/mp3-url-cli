@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+# ytmp3 — paste a link, get an mp3. Wraps yt-dlp (brew) with a clean terminal UI.
+set -uo pipefail
+
+# resolve the real script location, even when called through a symlink
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  target="$(readlink "$SELF")"
+  case "$target" in
+    /*) SELF="$target" ;;
+    *)  SELF="$(dirname "$SELF")/$target" ;;
+  esac
+done
+HERE="$(cd "$(dirname "$SELF")" && pwd -P)"
+DEFAULT_DIR="${YTMP3_DIR:-$HERE/downloads}"
+OUTDIR="$DEFAULT_DIR"
+QUIET=0
+SAVEAS=0
+INTERACTIVE=0
+
+# --- colors (off when not a tty or NO_COLOR set) ---------------------------
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  DIM=$'\033[2m'; BOLD=$'\033[1m'; RED=$'\033[31m'; GRN=$'\033[32m'
+  YEL=$'\033[33m'; CYA=$'\033[36m'; RST=$'\033[0m'
+else
+  DIM=; BOLD=; RED=; GRN=; YEL=; CYA=; RST=
+fi
+
+say()  { printf '%s\n' "$*"; }
+info() { printf '%s»%s %s\n' "$CYA" "$RST" "$*"; }
+ok()   { printf '%s✓%s %s\n' "$GRN" "$RST" "$*"; }
+warn() { printf '%s!%s %s\n' "$YEL" "$RST" "$*" >&2; }
+die()  { printf '%s✗%s %s\n' "$RED" "$RST" "$*" >&2; exit 1; }
+clear_line() { [ -t 1 ] && printf '\r\033[K'; return 0; }
+
+# --- what you see when you type just `mp3` ---------------------------------
+vitals() {
+  cat <<EOF
+${BOLD}ytmp3${RST} ${DIM}— paste a link, get an mp3${RST}
+
+  A small wrapper around yt-dlp + ffmpeg. Give it any video or audio link and
+  it pulls the audio out, converts it to mp3, embeds the cover art and tags,
+  and drops the file somewhere sensible.
+
+${BOLD}Use it${RST}
+  mp3 <url>                 download a link
+  mp3 <url> <url> <url>     several at once
+  mp3 <url> -s              pick where to save it (menu)
+  mp3 <url> -q              quiet: just print the saved path
+  mp3 -i                    paste a batch of links, blank line to start
+  pbpaste | mp3             use whatever's on the clipboard
+
+${BOLD}Options${RST}
+  -s, --saveas       choose the folder from a short menu
+  -q, --quiet        minimal output (can't be combined with -s)
+  -o, --out DIR      save straight to DIR
+  -i, --interactive  paste-a-batch mode
+  -h, --help         this screen
+
+${BOLD}Where files go${RST}
+  $DEFAULT_DIR
+  named  ${DIM}YYYY-MM-DD Title.mp3${RST}
+
+${BOLD}This tool lives at${RST}
+  $HERE
+  ${DIM}full docs: $HERE/README.md${RST}
+
+${DIM}ytmp3 and mp3 are the same command.  Env: YTMP3_DIR${RST}
+EOF
+}
+
+# --- deps ------------------------------------------------------------------
+check_deps() {
+  local missing=()
+  command -v yt-dlp >/dev/null 2>&1 || missing+=(yt-dlp)
+  command -v ffmpeg >/dev/null 2>&1 || missing+=(ffmpeg)
+  [ ${#missing[@]} -eq 0 ] && return 0
+  warn "missing: ${missing[*]}"
+  say  "${DIM}install with:${RST} brew install ${missing[*]}"
+  exit 127
+}
+
+# --- input -----------------------------------------------------------------
+URLS=()
+
+collect_stdin() {
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"   # ltrim
+    line="${line%"${line##*[![:space:]]}"}"   # rtrim
+    [ -z "$line" ] && continue
+    URLS+=("$line")
+  done
+}
+
+collect_interactive() {
+  say "${BOLD}ytmp3${RST} ${DIM}— paste links, one per line. empty line to start, ctrl-c to quit.${RST}"
+  local line
+  while true; do
+    printf '%s→%s ' "$CYA" "$RST"
+    IFS= read -r line || { say ""; break; }
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [ -z "$line" ] && break
+    URLS+=("$line")
+  done
+}
+
+# --- save-as menu ----------------------------------------------------------
+pick_dir() {
+  [ -t 0 ] || die "-s needs a terminal to ask in (drop it, or use -o DIR)"
+  local choice
+  say "${BOLD}where should it go?${RST}"
+  say "  ${CYA}1${RST}  default    ${DIM}$DEFAULT_DIR${RST}"
+  say "  ${CYA}2${RST}  music      ${DIM}$HOME/Music${RST}"
+  say "  ${CYA}3${RST}  downloads  ${DIM}$HOME/Downloads${RST}"
+  say "  ${CYA}4${RST}  desktop    ${DIM}$HOME/Desktop${RST}"
+  while true; do
+    printf '%s→%s choose 1-4 %s[1]%s ' "$CYA" "$RST" "$DIM" "$RST"
+    IFS= read -r choice </dev/tty || { say ""; choice=1; }
+    choice="${choice#"${choice%%[![:space:]]*}"}"
+    choice="${choice%"${choice##*[![:space:]]}"}"
+    case "$choice" in
+      ''|1) OUTDIR="$DEFAULT_DIR";     break ;;
+      2)    OUTDIR="$HOME/Music";      break ;;
+      3)    OUTDIR="$HOME/Downloads";  break ;;
+      4)    OUTDIR="$HOME/Desktop";    break ;;
+      *)    warn "pick 1, 2, 3 or 4" ;;
+    esac
+  done
+  say ""
+}
+
+# --- args ------------------------------------------------------------------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)         vitals; exit 0 ;;
+    -s|--saveas)       SAVEAS=1; shift ;;
+    -q|--quiet)        QUIET=1; shift ;;
+    -i|--interactive)  INTERACTIVE=1; shift ;;
+    -o|--out)          OUTDIR="${2:?--out needs a directory}"; DEFAULT_DIR="$OUTDIR"; shift 2 ;;
+    --)                shift; while [ $# -gt 0 ]; do URLS+=("$1"); shift; done ;;
+    -*)                die "unknown option: $1  ${DIM}(try: mp3 -h)${RST}" ;;
+    *)                 URLS+=("$1"); shift ;;
+  esac
+done
+
+# -q and -s pull in opposite directions: one asks, the other stays silent.
+if [ "$QUIET" -eq 1 ] && [ "$SAVEAS" -eq 1 ]; then
+  die "-q and -s can't be used together — -s needs to ask you a question"
+fi
+
+check_deps
+
+# No links anywhere and nothing asked for → show the vitals.
+# Only read stdin when it's genuinely a pipe or a file (`pbpaste | mp3`,
+# `mp3 < links.txt`). Anything else — a tty, /dev/null, a terminal that doesn't
+# report itself as one — falls through to the summary instead of sitting there
+# silently waiting on input that will never arrive.
+if [ ${#URLS[@]} -eq 0 ] && [ "$INTERACTIVE" -eq 0 ]; then
+  if [ ! -t 0 ] && { [ -p /dev/stdin ] || [ -f /dev/stdin ]; }; then
+    collect_stdin
+  else
+    vitals; exit 0
+  fi
+fi
+[ ${#URLS[@]} -eq 0 ] && [ "$INTERACTIVE" -eq 1 ] && collect_interactive
+[ ${#URLS[@]} -eq 0 ] && { vitals; exit 1; }
+
+[ "$SAVEAS" -eq 1 ] && pick_dir
+
+mkdir -p "$OUTDIR" || die "cannot create $OUTDIR"
+
+# --- download --------------------------------------------------------------
+# yt-dlp writes the final path to PATHLOG; anything it complains about to ERRLOG
+PATHLOG="$(mktemp -t ytmp3)" || die "cannot create temp file"
+ERRLOG="$(mktemp -t ytmp3err)" || die "cannot create temp file"
+trap 'rm -f "$PATHLOG" "$ERRLOG"' EXIT
+
+fetch() {
+  local url="$1"
+  local extra=()
+  if [ "$QUIET" -eq 1 ]; then
+    extra=(--no-progress)
+  else
+    extra=(--progress --print 'before_dl:    %(title)s')
+  fi
+  : > "$PATHLOG"; : > "$ERRLOG"
+  # Audio quality is automatic, and deliberately not configurable:
+  #   -f  grab the audio-only stream (no video is ever downloaded), capping at
+  #       stereo so we skip fat 5.1 streams that would just get downmixed.
+  #       yt-dlp's default sort then takes the best of what's left — on YouTube
+  #       that's opus ~130k over aac ~129k. `<=?2` keeps formats that don't
+  #       report a channel count (most non-YouTube sites).
+  #   --audio-quality 0  LAME V0 (~245k VBR), the top mp3 setting. The source is
+  #       already lossy, so this is about not stacking new artifacts on old ones.
+  yt-dlp \
+    --print-to-file 'after_move:%(filepath)s' "$PATHLOG" \
+    --format 'bestaudio[audio_channels<=?2]/bestaudio/best' \
+    --extract-audio --audio-format mp3 --audio-quality 0 \
+    --embed-thumbnail --embed-metadata \
+    --no-playlist --no-warnings --no-part \
+    --windows-filenames \
+    --paths "$OUTDIR" \
+    --output '%(upload_date>%Y-%m-%d,epoch>%Y-%m-%d)s %(title).100s.%(ext)s' \
+    --quiet \
+    "${extra[@]}" \
+    "$url" 2>"$ERRLOG"
+}
+
+# Turn yt-dlp's error wall into one plain sentence.
+explain_failure() {
+  local e
+  e="$(tr '[:upper:]' '[:lower:]' < "$ERRLOG" | tr '\n' ' ')"
+  case "$e" in
+    *"private video"*|*"sign in if you've been granted access"*)
+                                      say_reason "Link is private" ;;
+    *"members-only"*|*"join this channel"*)
+                                      say_reason "Link is members-only" ;;
+    *"removed by the uploader"*|*"account associated"*"terminated"*)
+                                      say_reason "Link is dead — the uploader removed it" ;;
+    *"video unavailable"*|*"is not available"*|*"no longer available"*)
+                                      say_reason "Link is unavailable — taken down or region-locked" ;;
+    *"404"*|*"not found"*)            say_reason "Link is dead — 404, nothing there" ;;
+    *"410"*|*"gone"*)                 say_reason "Link is dead — the page is gone" ;;
+    *"403"*|*"forbidden"*)            say_reason "Link is blocked — the site refused the download" ;;
+    *"confirm your age"*|*"age-restricted"*|*"inappropriate for some users"*)
+                                      say_reason "Link is age-restricted — needs a signed-in account" ;;
+    *"copyright"*|*"blocked it on copyright"*)
+                                      say_reason "Link is blocked on copyright grounds" ;;
+    *"geo"*"restrict"*|*"in your country"*|*"from your location"*|*"available in your region"*)
+                                      say_reason "Link is region-locked — not available where you are" ;;
+    *"live event will begin"*|*"premieres in"*|*"is live"*)
+                                      say_reason "That's a live/upcoming stream, not a finished video" ;;
+    *"unsupported url"*|*"is not a valid url"*|*"unable to extract"*)
+                                      say_reason "That link isn't something ytmp3 can pull audio from" ;;
+    *"name or service not known"*|*"temporary failure in name resolution"*|*"nodename nor servname"*)
+                                      say_reason "Site not found — check the address, or your connection" ;;
+    *"unable to connect"*|*"connection refused"*|*"timed out"*|*"network is unreachable"*)
+                                      say_reason "Couldn't reach the site — check your connection" ;;
+    *"sign in to confirm you're not a bot"*|*"cookies"*)
+                                      say_reason "The site wants a signed-in browser for this one" ;;
+    *"requested format is not available"*)
+                                      say_reason "No downloadable audio on that page" ;;
+    *"ffmpeg"*|*"postprocessing"*)    say_reason "Downloaded, but the mp3 conversion failed" ;;
+    *)                                say_reason "Couldn't download this one" ;;
+  esac
+}
+
+# print the reason, plus the raw yt-dlp line underneath unless we're quiet
+say_reason() {
+  warn "$1"
+  if [ "$QUIET" -eq 0 ]; then
+    local raw
+    raw="$(grep -m1 -i 'error' "$ERRLOG" 2>/dev/null | sed 's/^ERROR: //')"
+    [ -n "$raw" ] && printf '%s  %s%s\n' "$DIM" "${raw:0:120}" "$RST" >&2
+  fi
+  return 0
+}
+
+total=${#URLS[@]}
+done_n=0; fail_n=0; i=0
+
+if [ "$QUIET" -eq 0 ]; then
+  info "$total link$([ "$total" -eq 1 ] || echo s) → ${BOLD}$OUTDIR${RST}"
+  say ""
+fi
+
+for url in "${URLS[@]}"; do
+  i=$((i + 1))
+  [ "$QUIET" -eq 0 ] && printf '%s[%d/%d]%s %s\n' "$DIM" "$i" "$total" "$RST" "$url"
+  if fetch "$url"; then
+    clear_line
+    done_n=$((done_n + 1))
+    saved="$(tail -n 1 "$PATHLOG" 2>/dev/null)"
+    if [ "$QUIET" -eq 1 ]; then
+      say "${saved:-saved to $OUTDIR}"
+    elif [ -n "$saved" ]; then
+      ok "saved"
+      printf '%s  %s%s\n' "$DIM" "$saved" "$RST"
+    else
+      ok "saved to $OUTDIR"
+    fi
+  else
+    clear_line
+    fail_n=$((fail_n + 1))
+    explain_failure
+    [ "$QUIET" -eq 1 ] && printf '%s  %s%s\n' "$DIM" "$url" "$RST" >&2
+  fi
+  [ "$QUIET" -eq 0 ] && say ""
+done
+
+if [ "$QUIET" -eq 1 ]; then
+  [ "$fail_n" -eq 0 ] || exit 1
+  exit 0
+fi
+
+if [ "$fail_n" -eq 0 ]; then
+  ok "$done_n file$([ "$done_n" -eq 1 ] || echo s) in $OUTDIR"
+else
+  warn "$done_n ok, $fail_n failed — $OUTDIR"
+  exit 1
+fi
